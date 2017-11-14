@@ -79,4 +79,6 @@ for i in range(0, rows - 1):
     else:
         y = pitches[i + 1]
         next_state[i] = get_state(y)
-    
+
+obs = np.column_stack((state, action, reward, next_state))
+np.savetxt('Documents/CS 238/Final Project/obs.csv', obs, delimiter = ',')
