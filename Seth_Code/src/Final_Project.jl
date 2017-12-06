@@ -3,6 +3,7 @@ using DataFrames
 using DataStructures
 using Iterators
 using StatsBase
+using Distributions
 
 ############################################################
 # Function: write_Policy(dag::DiGraph, idx2names, filename)
@@ -10,7 +11,7 @@ using StatsBase
 # Description: 
 ############################################################
 function write_Policy(policy::Array{Int64,1}, score::Float64)
-    open(outputfilename, "w") do io
+    open(outputfilename, "a") do io
         @printf(io, "Policy Score: %f\n", score)
         @printf(io, "Baseline Score: %f\n", baseline)
         for s= 1:kNumStates
@@ -27,6 +28,7 @@ end
 function computePolicy()   
     Pi, score = QLearning()
     #Pi, score = Sarsa()
+    #Pi, score = BayesQLearning()
     write_Policy(Pi, score)
 end
 
@@ -37,12 +39,14 @@ end
 ############################################################
 function computeBaselineScore()
     aveScore = 0.0
-    for i = 1:100
+    n = 100
+    for i = 1:n
         Pi = rand(1:kNumActions,kNumStates)
         score = computePolicyScore(Pi)
         @printf("Random Policy Score: %f\r\n", score)
-        aveScore = aveScore + (score - aveScore)/i
+        aveScore = aveScore + score
     end
+    aveScore = aveScore/n
     @printf("Average of 100 Random Policy Scores: %f\r\n", aveScore)  
     return aveScore
 end
@@ -55,9 +59,12 @@ end
 function computePolicyScore(Pi::Array{Int64,1})
     U = zeros(kNumStates,1)
     for i = 1:100
+        #U_old = copy(U)
         for s = 1:kNumStates
             U[s] = R[s,Pi[s]] + sum(T[:,s,Pi[s]].*U[:])
         end
+        #difference = U - U_old
+        #@printf("Iteration: %i\tL2-norm of difference: %f\r\n", i, dot(difference,difference))
     end
     return sum(U)
 end
@@ -69,15 +76,38 @@ end
 ############################################################
 function QLearning()
     Q = zeros(kNumStates, kNumActions)
+    Q_old = ones(kNumStates, kNumActions)    
     Pi = Array{Int64,1}(kNumStates)
-    s = rand(1:kNumStates)
+    s = 1
+    converged = 0
+    i = 0
 
-    for k = 1:kIterations
-        a = rand(1:kNumActions)
+    #for k = 1:kIterations
+    while(converged == 0)
+        if ((i%10) == 0)
+            a = rand(1:kNumActions)
+        else
+            a = indmax(Q[s,:])
+        end
         sp = sample(collect(1:kNumStates), ProbabilityWeights(T[:,s,a]))
-        r = R[s,a]
+        r = computeRunsScored(s,sp)
         Q[s,a] = Q[s,a] + kLearnFactor*(r + kDiscountFactor*maximum(Q[sp,:]) - Q[s,a])
-        s = sp
+        
+        if ((i % 100000) == 0)
+            difference = norm(Q - Q_old,2)
+            @printf("Iteration: %i\tL2-norm of difference: %f\r\n", i, difference)
+            Q_old = copy(Q)
+            if (difference < 1.5)
+                converged = 1
+            end
+        end
+
+        if(sp == 289)   
+            s = 1
+        else
+            s = sp
+        end
+        i = i + 1
     end
 
     for s = 1:kNumStates
@@ -96,7 +126,7 @@ end
 function Sarsa()
     Q = zeros(kNumStates, kNumActions)
     Pi = Array{Int64,1}(kNumStates)
-    s = rand(1:kNumStates)
+    s = 1
     a = rand(1:kNumActions)
 
     for k = 1:kIterations
@@ -104,8 +134,12 @@ function Sarsa()
         sp = sample(collect(1:kNumStates), ProbabilityWeights(T[:,s,a]))
         r = R[s,a]
         Q[s,a] = Q[s,a] + kLearnFactor*(r + kDiscountFactor*Q[sp,ap] - Q[s,a])
-        a = ap        
-        s = sp
+        a = ap  
+        if(sp == 289)   
+            s = 0
+        else
+            s = sp
+        end
     end
 
     for s = 1:kNumStates
@@ -117,17 +151,80 @@ function Sarsa()
 end
 
 ############################################################
+# Function: BayesQLearning
+#
+# Description:
+############################################################
+function BayesQLearning()
+    Q = zeros(kNumStates, kNumActions)
+    Tdir = Array{Dirichlet{Float64},2}(kNumStates,kNumActions)
+    for s = 1:kNumStates
+    	for a = 1:kNumActions
+            prior = ones(kNumStates)*0.00001 
+            if(maximum(N[s,a,:]) == 0)
+                prior = ones(kNumStates)
+            end
+    		Tdir[s,a] = Dirichlet((prior + N[s,a,:]))
+     	end
+    end
+
+    Pi = Array{Int64,1}(kNumStates)
+    states = collect(1:kNumStates)
+    numGamesPlayed = 0
+    s = 1
+
+    while (numGamesPlayed < kNumGames2Play)
+        a = rand(1:kNumActions)
+        sp = sample(states, ProbabilityWeights(rand(Tdir[s,a])))
+        r =  computeRunsScored(s,sp)
+        Q[s,a] = Q[s,a] + kLearnFactor*(r + kDiscountFactor*maximum(Q[sp,:]) - Q[s,a])
+        if(sp == 289)   
+            numGamesPlayed = numGamesPlayed + 1
+            s = 1
+        else
+            s = sp
+        end
+    end
+
+    for s = 1:kNumStates
+        Pi[s] = indmax(Q[s,:])
+    end
+
+    score = computePolicyScore(Pi)
+    return Pi, score
+end
+
+function computeRunsScored(s,sp)
+    sNumRunners = numRunners((s-1) % 8)
+    spNumRunners = numRunners((sp-1) % 8)
+    sNumOuts = div((s-1),96)
+    spNumOuts = div((sp-1),96)
+    return sNumRunners - spNumRunners + 1 - spNumOuts + sNumOuts
+end
+
+function numRunners(runnerCode)
+    if (runnerCode == 0)
+        return 0
+    elseif (runnerCode in (1, 2, 3))
+        return 1
+    elseif (runnerCode in (4, 5, 6))
+        return 2
+    else
+        return 3
+    end
+end
+############################################################
 # Function: computeCountsMatrix
 #
 # Description:
 ############################################################
-function computeCountsMatrix(data::DataFrame)
-    N = zeros(kNumStates, kNumActions, kNumStates)
-    for i = 1:length(data[1])
-        s = data[i,1] + 1
-        a = data[i,2] + 1
-        sp = data[i,4] + 1
-        N[s, a, sp] = N[s, a, sp] + 1
+function computeCountsMatrix(data::Array{Int64,2})
+    N = zeros(Int64,kNumStates, kNumActions, kNumStates)
+    for i = 1:length(data[:,1])
+        s = data[i,1]
+        a = data[i,2]
+        sp = data[i,4]
+        N[s,a,sp] = N[s,a,sp] + 1
     end
     return N
 end
@@ -158,12 +255,12 @@ end
 #
 # Description:
 ############################################################
-function computeRewardMatrix(data::DataFrame)
+function computeRewardMatrix(data::Array{Int64,2})
     R = zeros(kNumStates, kNumActions)
     counts = zeros(kNumStates, kNumActions)
-    for i = 1:length(data[1])
-        s = data[i,1] + 1
-        a = data[i,2] + 1
+    for i = 1:length(data[:,1])
+        s = data[i,1]
+        a = data[i,2]
         r = data[i,3]
         counts[s,a] = counts[s,a] + 1
         rhat = r/sum(N[s,a,:])
@@ -172,25 +269,21 @@ function computeRewardMatrix(data::DataFrame)
     return R
 end
 
-############################################################
-# Function: initMatrices
-#
-# Description:
-############################################################
-function initMatrices(data::DataFrame)
-    return computeCountsMatrix(data), computeTransitionMatrix(), computeRewardMatrix(data)
-end
-
 #definitions
-inputfilename = "../obs.csv"
-outputfilename = "../final_project.policy"
+inputfilename = "../obs2.csv"
+outputfilename = "./Q_learning_Results/1_000_000_000_iterations_Checking_Convergence2.policy"
 const kNumActions = 63
-const kNumStates = 288
-const kDiscountFactor = 1
-const kLearnFactor = 0.5
-const kIterations = 100000000
+const kNumStates = 289
+kDiscountFactor = 0.9
+const kLearnFactor = 0.1
+const kIterations = 1000000000
+const kNumGames2Play = 10000000
+baseline = -39.392637
 
 #data = readtable(inputfilename)
-#N,T,R = initMatrices(data)
+#data = convert(Array{Int64}, data)
+#N = computeCountsMatrix(data)
+#T = computeTransitionMatrix()
+#R = computeRewardMatrix(data)
 #baseline = computeBaselineScore()
 computePolicy()
